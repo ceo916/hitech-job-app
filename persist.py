@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -13,7 +14,9 @@ import pandas as pd
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+_data_env = (os.environ.get("HITECH_DATA_DIR") or "").strip()
+DATA_DIR = Path(_data_env) if _data_env else BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR = DATA_DIR / "backups"
 DATA_FILE = DATA_DIR / "collected_jobs.csv"
 DB_FILE = DATA_DIR / "hitech_jobs.db"
@@ -22,6 +25,9 @@ MAIL_SETTINGS_FILE = DATA_DIR / "mail_settings.json"
 SHEETS_SETTINGS_FILE = DATA_DIR / "sheets_settings.json"
 CARD_DIR = DATA_DIR / "card"
 SENT_MAIL_FILE = DATA_DIR / "sent_emails.json"
+_SEED_PHRASES = BASE_DIR / "data" / "phrases.json"
+if _SEED_PHRASES.exists() and PHRASE_FILE.resolve() != _SEED_PHRASES.resolve() and not PHRASE_FILE.exists():
+    PHRASE_FILE.write_bytes(_SEED_PHRASES.read_bytes())
 
 COLUMNS = [
     "id",
