@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ DATA_FILE = DATA_DIR / "collected_jobs.csv"
 DB_FILE = DATA_DIR / "hitech_jobs.db"
 PHRASE_FILE = DATA_DIR / "phrases.json"
 MAIL_SETTINGS_FILE = DATA_DIR / "mail_settings.json"
+SHEETS_SETTINGS_FILE = DATA_DIR / "sheets_settings.json"
 CARD_DIR = DATA_DIR / "card"
 SENT_MAIL_FILE = DATA_DIR / "sent_emails.json"
 
@@ -39,6 +41,8 @@ COLUMNS = [
 
 LEADS_SHEET = "leads"
 PHRASES_SHEET = "phrases"
+SENT_SHEET = "sent_mail"
+SETTINGS_SHEET = "settings"
 
 
 def _secret(key: str, default=""):
@@ -48,8 +52,107 @@ def _secret(key: str, default=""):
         return default
 
 
+def parse_sheet_id(text: str) -> str:
+    raw = (text or "").strip()
+    if "/spreadsheets/d/" in raw:
+        return raw.split("/spreadsheets/d/")[1].split("/")[0]
+    return raw
+
+
+def load_sheets_file() -> dict:
+    if not SHEETS_SETTINGS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SHEETS_SETTINGS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_sheets_file(data: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SHEETS_SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _sa_info() -> dict:
+    file = load_sheets_file()
+    sa = file.get("gcp_service_account")
+    if isinstance(sa, dict) and sa.get("client_email"):
+        return sa
+    try:
+        sa = _secret("gcp_service_account")
+        if sa:
+            return dict(sa)
+    except Exception:
+        pass
+    return {}
+
+
+def _spreadsheet_id() -> str:
+    file = load_sheets_file()
+    sid = parse_sheet_id(str(file.get("spreadsheet_id") or ""))
+    if sid:
+        return sid
+    sheets = _secret("sheets") or {}
+    if isinstance(sheets, dict) and sheets.get("spreadsheet_id"):
+        return parse_sheet_id(str(sheets.get("spreadsheet_id") or ""))
+    return parse_sheet_id(str(_secret("spreadsheet_id") or ""))
+
+
+def sheets_enabled() -> bool:
+    return bool(_sa_info() and _spreadsheet_id())
+
+
+def storage_label() -> str:
+    return "공유 저장(구글 시트)" if sheets_enabled() else "이 기기만"
+
+
+def save_sheet_connection(spreadsheet_id: str, service_account: dict) -> str:
+    sid = parse_sheet_id(spreadsheet_id)
+    if not sid:
+        return "시트 주소 또는 아이디를 넣으세요."
+    if not isinstance(service_account, dict) or not service_account.get("client_email"):
+        return "서비스 계정 JSON이 올바르지 않습니다."
+    current = load_sheets_file()
+    current["spreadsheet_id"] = sid
+    current["gcp_service_account"] = service_account
+    save_sheets_file(current)
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    try:
+        _worksheet(LEADS_SHEET, COLUMNS)
+    except Exception as exc:
+        return f"시트에 연결하지 못했습니다. 서비스 계정 이메일에 시트 편집 권한을 주세요. ({exc})"
+    return ""
+
+
 def app_password() -> str:
-    return str(_secret("app_password") or "").strip()
+    pw = str(_secret("app_password") or "").strip()
+    if pw:
+        return pw
+    file = load_sheets_file()
+    pw = str(file.get("app_password") or "").strip()
+    if pw:
+        return pw
+    if sheets_enabled():
+        try:
+            return str(_setting("app_password") or "").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def save_app_password(password: str) -> None:
+    current = load_sheets_file()
+    current["app_password"] = (password or "").strip()
+    save_sheets_file(current)
+    if sheets_enabled():
+        try:
+            _save_setting("app_password", (password or "").strip())
+        except Exception:
+            pass
 
 
 def load_mail_settings() -> dict:
@@ -70,6 +173,12 @@ def load_mail_settings() -> dict:
                 app_pw = str(data.get("app_password") or app_pw).strip()
         except Exception:
             pass
+    if sheets_enabled():
+        try:
+            email = str(_setting("gmail_email") or email).strip() or email
+            app_pw = str(_setting("gmail_app_password") or app_pw).strip() or app_pw
+        except Exception:
+            pass
     return {"email": email, "app_password": app_pw}
 
 
@@ -83,6 +192,13 @@ def save_mail_settings(email: str, app_pw: str) -> None:
         ),
         encoding="utf-8",
     )
+    if sheets_enabled():
+        try:
+            _save_setting("gmail_email", (email or "").strip())
+            if (app_pw or "").strip():
+                _save_setting("gmail_app_password", (app_pw or "").strip())
+        except Exception:
+            pass
 
 
 def card_path() -> Path | None:
@@ -120,7 +236,7 @@ def norm_email(email: str) -> str:
     return (email or "").strip().lower()
 
 
-def load_sent_emails() -> dict:
+def _load_local_sent() -> dict:
     if not SENT_MAIL_FILE.exists():
         return {}
     try:
@@ -130,9 +246,65 @@ def load_sent_emails() -> dict:
         return {}
 
 
-def save_sent_emails(data: dict) -> None:
+def _save_local_sent(data: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SENT_MAIL_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_sheet_sent() -> dict:
+    ws = _worksheet(SENT_SHEET, ["email", "at", "id", "회사"])
+    out = {}
+    for row in ws.get_all_records():
+        key = norm_email(str(row.get("email") or ""))
+        if not key:
+            continue
+        out[key] = {
+            "at": str(row.get("at") or ""),
+            "id": str(row.get("id") or ""),
+            "회사": str(row.get("회사") or ""),
+        }
+    return out
+
+
+def _save_sheet_sent(data: dict) -> None:
+    ws = _worksheet(SENT_SHEET, ["email", "at", "id", "회사"])
+    rows = [["email", "at", "id", "회사"]]
+    for email, info in (data or {}).items():
+        info = info if isinstance(info, dict) else {}
+        rows.append([
+            str(email),
+            str(info.get("at") or ""),
+            str(info.get("id") or ""),
+            str(info.get("회사") or ""),
+        ])
+    ws.clear()
+    ws.update(rows, "A1")
+
+
+def load_sent_emails() -> dict:
+    cached = _mem_get("sent", 8)
+    if cached is not None:
+        return dict(cached)
+    data = _load_local_sent()
+    if sheets_enabled():
+        try:
+            remote = _load_sheet_sent()
+            data.update(remote)
+            _save_local_sent(data)
+        except Exception:
+            pass
+    _mem_set("sent", data)
+    return dict(data)
+
+
+def save_sent_emails(data: dict) -> None:
+    _save_local_sent(data)
+    _mem_set("sent", data)
+    if sheets_enabled():
+        try:
+            _save_sheet_sent(data)
+        except Exception:
+            pass
 
 
 def mark_email_sent(email: str, record_id: str = "", company: str = "", stamp: str = "") -> str:
@@ -154,7 +326,7 @@ def sent_mail_info(email: str) -> dict | None:
     if key in data and isinstance(data[key], dict):
         return data[key]
     try:
-        records = _load_local_records()
+        records = load_records()
     except Exception:
         return None
     if records is None or records.empty:
@@ -208,33 +380,8 @@ def send_partner_mail(to: str, subject: str, body: str) -> str:
     return ""
 
 
-def sheets_enabled() -> bool:
-    try:
-        sa = _secret("gcp_service_account")
-        sheets = _secret("sheets") or {}
-        sid = ""
-        if isinstance(sheets, dict):
-            sid = str(sheets.get("spreadsheet_id") or "")
-        if not sid:
-            sid = str(_secret("spreadsheet_id") or "")
-        return bool(sa and sid)
-    except Exception:
-        return False
-
-
-def storage_label() -> str:
-    return "구글 시트" if sheets_enabled() else "이 기기"
-
-
-def _spreadsheet_id() -> str:
-    sheets = _secret("sheets") or {}
-    if isinstance(sheets, dict) and sheets.get("spreadsheet_id"):
-        return str(sheets["spreadsheet_id"])
-    return str(_secret("spreadsheet_id") or "")
-
-
 @st.cache_resource
-def _sheet_book():
+def _sheet_book(sid: str, sa_email: str):
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -242,13 +389,14 @@ def _sheet_book():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
+    creds = Credentials.from_service_account_info(_sa_info(), scopes=scopes)
     client = gspread.authorize(creds)
-    return client.open_by_key(_spreadsheet_id())
+    return client.open_by_key(sid)
 
 
 def _worksheet(title: str, headers: list[str]):
-    book = _sheet_book()
+    sa = _sa_info()
+    book = _sheet_book(_spreadsheet_id(), str(sa.get("client_email") or ""))
     try:
         ws = book.worksheet(title)
     except Exception:
@@ -259,6 +407,105 @@ def _worksheet(title: str, headers: list[str]):
     if not existing:
         ws.update([headers], "A1")
     return ws
+
+
+def _settings_map() -> dict:
+    ws = _worksheet(SETTINGS_SHEET, ["key", "value"])
+    rows = ws.get_all_records()
+    out = {}
+    for row in rows:
+        key = str(row.get("key") or "").strip()
+        if key:
+            out[key] = str(row.get("value") or "")
+    return out
+
+
+def _setting(key: str) -> str:
+    return _settings_map().get(key, "")
+
+
+def _save_setting(key: str, value: str) -> None:
+    data = _settings_map()
+    data[key] = value
+    ws = _worksheet(SETTINGS_SHEET, ["key", "value"])
+    rows = [["key", "value"]] + [[k, data[k]] for k in data]
+    ws.clear()
+    ws.update(rows, "A1")
+
+
+def merge_records(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    a = normalize_records(left)
+    b = normalize_records(right)
+    if a.empty:
+        return b
+    if b.empty:
+        return a
+    combined: dict[str, dict] = {}
+    for src in (a, b):
+        for _, row in src.iterrows():
+            item = {c: str(row.get(c) or "") for c in COLUMNS}
+            rid = item["id"]
+            if rid not in combined:
+                combined[rid] = item
+                continue
+            prev = combined[rid]
+            for col in COLUMNS:
+                old = prev.get(col) or ""
+                new = item.get(col) or ""
+                if col in ("메일발송", "카톡발송", "등록일시"):
+                    prev[col] = max(old, new)
+                elif new and (not old or len(new) > len(old)):
+                    prev[col] = new
+            combined[rid] = prev
+    return normalize_records(pd.DataFrame(list(combined.values())))
+
+
+def merge_phrases(left: dict, right: dict) -> dict:
+    out = {"팀장": [], "협력사": []}
+    for kind in ("팀장", "협력사"):
+        by_id = {}
+        for src in (left or {}, right or {}):
+            for item in src.get(kind) or []:
+                pid = str(item.get("id") or uuid.uuid4().hex[:10])
+                by_id[pid] = dict(item)
+                by_id[pid]["id"] = pid
+        out[kind] = list(by_id.values())
+    return out
+
+
+def unify_all() -> str:
+    if not sheets_enabled():
+        return "구글 시트를 먼저 연결하세요."
+    try:
+        local_r = _load_local_records()
+        remote_r = _load_sheet_records()
+        merged_r = merge_records(local_r, remote_r)
+        _save_local_records(merged_r)
+        _save_sheet_records(merged_r)
+
+        local_p = _load_local_phrases() or default_phrases()
+        remote_p = _load_sheet_phrases() or {"팀장": [], "협력사": []}
+        merged_p = merge_phrases(local_p, remote_p)
+        _save_local_phrases(merged_p)
+        _save_sheet_phrases(merged_p)
+
+        local_s = _load_local_sent()
+        remote_s = _load_sheet_sent()
+        local_s.update(remote_s)
+        _save_local_sent(local_s)
+        _save_sheet_sent(local_s)
+        mail = load_mail_settings()
+        if mail.get("email"):
+            _save_setting("gmail_email", mail.get("email") or "")
+        if mail.get("app_password"):
+            _save_setting("gmail_app_password", mail.get("app_password") or "")
+        pw = app_password()
+        if pw:
+            _save_setting("app_password", pw)
+        _mem_clear()
+    except Exception as exc:
+        return f"데이터를 합치지 못했습니다. ({exc})"
+    return ""
 
 
 def normalize_records(df: pd.DataFrame) -> pd.DataFrame:
@@ -283,6 +530,26 @@ def normalize_records(df: pd.DataFrame) -> pd.DataFrame:
 
 
 _PHRASE_SEED: dict | None = None
+_MEM = {}
+
+
+def _mem_get(key: str, ttl: float):
+    hit = _MEM.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    return None
+
+
+def _mem_set(key: str, value) -> None:
+    _MEM[key] = (time.time(), value)
+
+
+def _mem_clear(*keys: str) -> None:
+    if not keys:
+        _MEM.clear()
+        return
+    for key in keys:
+        _MEM.pop(key, None)
 
 
 def set_phrase_seed(data: dict) -> None:
@@ -353,24 +620,37 @@ def _save_sheet_records(df: pd.DataFrame) -> None:
 
 
 def load_records() -> pd.DataFrame:
+    cached = _mem_get("records", 8)
+    if cached is not None:
+        return cached.copy()
     local = _load_local_records()
     if not sheets_enabled():
+        _mem_set("records", local)
         return local
     try:
         remote = _load_sheet_records()
         if remote.empty and not local.empty:
             _save_sheet_records(local)
+            _mem_set("records", local)
             return local
-        return remote
+        if not remote.empty:
+            _save_local_records(remote)
+            _mem_set("records", remote)
+            return remote
+        _mem_set("records", local)
+        return local
     except Exception:
+        _mem_set("records", local)
         return local
 
 
 def save_records(df: pd.DataFrame) -> None:
     _save_local_records(df)
+    _mem_clear("records")
     if sheets_enabled():
         try:
             _save_sheet_records(df)
+            _mem_set("records", normalize_records(df))
         except Exception:
             pass
 
@@ -467,3 +747,25 @@ def save_phrases(data: dict) -> None:
             _save_sheet_phrases(data)
         except Exception:
             pass
+
+
+def cloud_secrets_toml() -> str:
+    sa = _sa_info()
+    sid = _spreadsheet_id()
+    lines = []
+    pw = str(load_sheets_file().get("app_password") or "").strip()
+    if pw:
+        lines.append(f"app_password = {json.dumps(pw, ensure_ascii=False)}")
+    if sid:
+        lines.append("[sheets]")
+        lines.append(f"spreadsheet_id = {json.dumps(sid)}")
+    if sa:
+        lines.append("[gcp_service_account]")
+        for key, value in sa.items():
+            if key == "private_key":
+                lines.append(f'private_key = """{value}"""')
+            elif isinstance(value, str):
+                lines.append(f"{key} = {json.dumps(value)}")
+            else:
+                lines.append(f"{key} = {json.dumps(value)}")
+    return "\n".join(lines) + "\n"

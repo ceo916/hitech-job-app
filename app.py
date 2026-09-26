@@ -616,8 +616,50 @@ def require_login() -> bool:
 
 
 def render_backup_bar(records: pd.DataFrame) -> None:
-    with st.expander("백업 / 복원"):
-        st.caption(f"지금 저장 위치: {persist.storage_label()}. 클라우드에서는 가끔 목록이 비워질 수 있으니 백업을 받아 두세요.")
+    with st.expander("공유 / 백업", expanded=not persist.sheets_enabled()):
+        st.caption(f"지금 저장 위치: {persist.storage_label()}. 구글 시트를 연결하면 폰·컴퓨터·직원이 같은 목록을 봅니다.")
+        sheet_url = st.text_input(
+            "구글 시트 주소 또는 아이디",
+            value=persist._spreadsheet_id(),
+            key="share_sheet_id",
+            placeholder="https://docs.google.com/spreadsheets/d/……/edit",
+        )
+        sa_file = st.file_uploader("서비스 계정 JSON", type=["json"], key="share_sa_json")
+        if st.button("시트 연결하고 데이터 합치기", type="primary", key="connect_sheets"):
+            sa_info = persist._sa_info()
+            if sa_file is not None:
+                try:
+                    sa_info = json.loads(sa_file.getvalue().decode("utf-8"))
+                except Exception:
+                    st.error("JSON 파일을 읽지 못했습니다.")
+                    sa_info = {}
+            err = persist.save_sheet_connection(sheet_url, sa_info)
+            if err:
+                st.error(err)
+            else:
+                merge_err = persist.unify_all()
+                if merge_err:
+                    st.error(merge_err)
+                else:
+                    st.success("연결했습니다. 이제 같은 시트에 저장됩니다.")
+                    st.rerun()
+        if persist.sheets_enabled():
+            st.caption(f"연결됨. 서비스 계정: {persist._sa_info().get('client_email') or ''}")
+            toml_text = persist.cloud_secrets_toml()
+            if toml_text.strip():
+                st.download_button(
+                    "클라우드 Secrets 내용 받기",
+                    data=toml_text.encode("utf-8"),
+                    file_name="streamlit_secrets.toml",
+                    mime="text/plain",
+                    width="stretch",
+                    key="dl_cloud_secrets",
+                )
+                st.caption("Streamlit Cloud: 앱 오른쪽 아래 Manage app → Settings → Secrets 에 이 내용을 붙여넣으면 폰·직원도 같은 데이터를 씁니다.")
+        pw = st.text_input("접속 비밀번호(직원과 같이 쓸 때)", type="password", key="share_app_pw")
+        if st.button("비밀번호 저장", key="save_app_pw"):
+            persist.save_app_password(pw)
+            st.success("접속 비밀번호를 저장했습니다.")
         st.download_button(
             "전체 목록 CSV 받기",
             data=records.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
