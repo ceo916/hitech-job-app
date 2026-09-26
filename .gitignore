@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+data/collected_jobs.csv
+data/hitech_jobs.db
+data/backups/
+data/images/
+data/mail_settings.json
+data/sent_emails.json
+data/card/
+.DS_Store
